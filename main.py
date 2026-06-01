@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List
 import os
+import re
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -36,20 +36,38 @@ BODY_CLR  = RGBColor(0xCC, 0xDD, 0xEE)
 HEAD_CLR  = RGBColor(0x4F, 0xC3, 0xF7)   # açık mavi başlık
 
 
-class SlideItem(BaseModel):
-    id: str
-    type: str   # "headline" | "bullet"
-    content: str
-
-
-class Konu(BaseModel):
-    konu_id: int
-    slides: List[SlideItem]
-
-
 class PPTXRequest(BaseModel):
     proje_adi: str
-    konular: List[Konu]
+
+
+KONU_RE = re.compile(r"^Konu(\d+)$")
+SLIDE_RE = re.compile(r"^Slide(\d+)\.txt$")
+
+
+def list_konular(proje_dir: Path):
+    """proje_dir altındaki Konu{N} klasörlerini N'e göre sıralı döndürür."""
+    konular = []
+    for child in proje_dir.iterdir():
+        if not child.is_dir():
+            continue
+        m = KONU_RE.match(child.name)
+        if m:
+            konular.append((int(m.group(1)), child))
+    konular.sort(key=lambda t: t[0])
+    return konular
+
+
+def list_slides(konu_dir: Path):
+    """konu_dir altındaki Slide{M}.txt dosyalarını M'e göre sıralı döndürür."""
+    slides = []
+    for child in konu_dir.iterdir():
+        if not child.is_file():
+            continue
+        m = SLIDE_RE.match(child.name)
+        if m:
+            slides.append((int(m.group(1)), child))
+    slides.sort(key=lambda t: t[0])
+    return slides
 
 
 def set_bg(slide, color: RGBColor):
@@ -88,13 +106,13 @@ def add_text_box(slide, text: str, slide_type: str):
             p.alignment = PP_ALIGN.LEFT
 
 
-def add_slide(prs: Presentation, konu_id: int, proje_adi: str, slide_data: SlideItem):
+def add_slide(prs: Presentation, konu_dir: Path, slide_no: int, text: str, slide_type: str):
     blank = prs.slide_layouts[6]
     slide = prs.slides.add_slide(blank)
     set_bg(slide, BG_COLOR)
-    add_text_box(slide, slide_data.content, slide_data.type)
+    add_text_box(slide, text, slide_type)
 
-    img_path = FILES_BASE / proje_adi / f"Konu{konu_id}" / f"image{slide_data.id}.png"
+    img_path = konu_dir / f"imageSlide{slide_no}.png"
     if img_path.exists():
         slide.shapes.add_picture(str(img_path), IMG_LEFT, IMG_TOP, IMG_W, IMG_H)
 
@@ -103,20 +121,31 @@ def add_slide(prs: Presentation, konu_id: int, proje_adi: str, slide_data: Slide
 
 @app.post("/generate-pptx")
 def generate_pptx(req: PPTXRequest):
+    proje_dir = FILES_BASE / req.proje_adi
+    if not proje_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Proje klasörü bulunamadı: {req.proje_adi}")
+
     prs = Presentation()
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
 
-    for konu in req.konular:
-        for slide_data in konu.slides:
-            add_slide(prs, konu.konu_id, req.proje_adi, slide_data)
+    slide_count = 0
+    for konu_id, konu_dir in list_konular(proje_dir):
+        for slide_no, slide_file in list_slides(konu_dir):
+            text = slide_file.read_text(encoding="utf-8")
+            slide_type = "headline" if slide_no == 1 else "bullet"
+            add_slide(prs, konu_dir, slide_no, text, slide_type)
+            slide_count += 1
+
+    if slide_count == 0:
+        raise HTTPException(status_code=404, detail=f"Projede slide içeriği bulunamadı: {req.proje_adi}")
 
     output_dir = OUTPUT_BASE / req.proje_adi
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{req.proje_adi}.pptx"
     prs.save(str(output_path))
 
-    return {"status": "ok", "path": str(output_path), "slide_count": sum(len(k.slides) for k in req.konular)}
+    return {"status": "ok", "path": str(output_path), "slide_count": slide_count}
 
 
 @app.get("/health")
